@@ -20,7 +20,20 @@ const blobToArrayBuffer = (blob: Blob): Promise<ArrayBuffer> => {
   });
 };
 
-export const initDB = (): Promise<void> => {
+export const initDB = async (): Promise<void> => {
+  // Try to request persistent storage
+  // This helps prevent the OS from clearing the data to free up space
+  if (navigator.storage && navigator.storage.persist) {
+    try {
+      const isPersisted = await navigator.storage.persisted();
+      if (!isPersisted) {
+        await navigator.storage.persist();
+      }
+    } catch (e) {
+      console.warn("Failed to request persistent storage", e);
+    }
+  }
+
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
 
@@ -58,8 +71,11 @@ export const saveMemoToDB = async (memo: Memo): Promise<void> => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       const store = tx.objectStore(STORE_NAME);
       
-      store.put(dbItem);
+      const putRequest = store.put(dbItem);
       
+      // Explicitly handle request success/error in addition to transaction
+      putRequest.onerror = () => reject(putRequest.error);
+
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     };
