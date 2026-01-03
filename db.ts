@@ -3,26 +3,13 @@ import { Memo } from './types';
 const DB_NAME = 'VoiceMemosDB';
 const STORE_NAME = 'memos';
 const DB_VERSION = 1;
+const CACHE_NAME = 'voice-memos-audio-v1';
 
-// Helper to convert Blob to ArrayBuffer
-const blobToArrayBuffer = (blob: Blob): Promise<ArrayBuffer> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      if (reader.result) {
-        resolve(reader.result as ArrayBuffer);
-      } else {
-        reject(new Error("Failed to convert blob to array buffer"));
-      }
-    };
-    reader.onerror = reject;
-    reader.readAsArrayBuffer(blob);
-  });
-};
+// Check if Cache API is supported (Available in secure contexts)
+const hasCacheApi = 'caches' in self;
 
 export const initDB = async (): Promise<void> => {
   // Try to request persistent storage
-  // This helps prevent the OS from clearing the data to free up space
   if (navigator.storage && navigator.storage.persist) {
     try {
       const isPersisted = await navigator.storage.persisted();
@@ -50,20 +37,38 @@ export const initDB = async (): Promise<void> => {
 };
 
 export const saveMemoToDB = async (memo: Memo): Promise<void> => {
-  // Convert Blob to ArrayBuffer for better compatibility (especially iOS Safari)
-  const arrayBuffer = await blobToArrayBuffer(memo.blob);
-  
-  // Create a storage object that doesn't contain the raw Blob
-  // (though some browsers support it, ArrayBuffer is safer)
-  const dbItem = {
+  // 1. Try to save the heavy Audio Blob to Cache API
+  // This is often more stable on iOS than large blobs in IndexedDB
+  let savedToCache = false;
+  if (hasCacheApi) {
+    try {
+      const cache = await caches.open(CACHE_NAME);
+      await cache.put(
+        `/memo/${memo.id}`, 
+        new Response(memo.blob, { headers: { 'Content-Type': memo.blob.type } })
+      );
+      savedToCache = true;
+    } catch (e) {
+      console.warn("Cache API save failed, falling back to IDB", e);
+    }
+  }
+
+  // 2. Prepare Metadata for IndexedDB
+  const dbItem: any = {
     id: memo.id,
     title: memo.title,
     duration: memo.duration,
     createdAt: memo.createdAt,
-    audioData: arrayBuffer,
     mimeType: memo.blob.type
   };
 
+  // Fallback: If Cache API failed or isn't available, store data in IDB
+  if (!savedToCache) {
+    // Convert to ArrayBuffer for IDB stability
+    dbItem.audioData = await memo.blob.arrayBuffer();
+  }
+
+  // 3. Save Metadata to IDB
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onsuccess = () => {
@@ -73,7 +78,6 @@ export const saveMemoToDB = async (memo: Memo): Promise<void> => {
       
       const putRequest = store.put(dbItem);
       
-      // Explicitly handle request success/error in addition to transaction
       putRequest.onerror = () => reject(putRequest.error);
 
       tx.oncomplete = () => resolve();
@@ -83,8 +87,9 @@ export const saveMemoToDB = async (memo: Memo): Promise<void> => {
   });
 };
 
-export const getMemosFromDB = (): Promise<Memo[]> => {
-  return new Promise((resolve, reject) => {
+export const getMemosFromDB = async (): Promise<Memo[]> => {
+  // 1. Get all metadata from IndexedDB
+  const items: any[] = await new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onsuccess = () => {
       const db = request.result;
@@ -92,45 +97,75 @@ export const getMemosFromDB = (): Promise<Memo[]> => {
       const store = tx.objectStore(STORE_NAME);
       const getAllRequest = store.getAll();
 
-      getAllRequest.onsuccess = () => {
-        const result = getAllRequest.result;
-        
-        const hydratedMemos: Memo[] = result.map((item: any) => {
-          let blob: Blob;
-          
-          // Handle new format (ArrayBuffer)
-          if (item.audioData) {
-            blob = new Blob([item.audioData], { type: item.mimeType || 'audio/webm' });
-          } 
-          // Handle legacy format (Direct Blob storage)
-          else if (item.blob) {
-            blob = item.blob;
-          } else {
-            // Fallback empty blob
-            blob = new Blob([], { type: 'audio/webm' });
-          }
-
-          return {
-            id: item.id,
-            title: item.title,
-            duration: item.duration,
-            createdAt: item.createdAt,
-            url: URL.createObjectURL(blob),
-            blob: blob
-          };
-        });
-
-        // Sort by newest first by default
-        hydratedMemos.sort((a, b) => b.createdAt - a.createdAt);
-        resolve(hydratedMemos);
-      };
+      getAllRequest.onsuccess = () => resolve(getAllRequest.result);
       getAllRequest.onerror = () => reject(getAllRequest.error);
     };
     request.onerror = () => reject(request.error);
   });
+
+  // 2. Hydrate blobs from Cache API or IDB fallback
+  const memos: Memo[] = [];
+  let cache: Cache | null = null;
+  
+  if (hasCacheApi) {
+    try {
+        cache = await caches.open(CACHE_NAME);
+    } catch(e) { console.warn("Could not open cache", e); }
+  }
+
+  for (const item of items) {
+    let blob: Blob | null = null;
+
+    // A. Try Cache API
+    if (cache) {
+        try {
+            const response = await cache.match(`/memo/${item.id}`);
+            if (response) {
+                blob = await response.blob();
+            }
+        } catch (e) { console.warn("Cache match error", e); }
+    }
+
+    // B. Try IDB ArrayBuffer (Fallback / Legacy data)
+    if (!blob && item.audioData) {
+        blob = new Blob([item.audioData], { type: item.mimeType || 'audio/webm' });
+    }
+    
+    // C. Try IDB Direct Blob (Very old legacy data)
+    if (!blob && item.blob) {
+        blob = item.blob;
+    }
+
+    // Only add if we successfully recovered the audio
+    if (blob) {
+      memos.push({
+        id: item.id,
+        title: item.title,
+        duration: item.duration,
+        createdAt: item.createdAt,
+        url: URL.createObjectURL(blob),
+        blob: blob
+      });
+    }
+  }
+
+  // Sort by newest first
+  memos.sort((a, b) => b.createdAt - a.createdAt);
+  return memos;
 };
 
-export const deleteMemoFromDB = (id: string): Promise<void> => {
+export const deleteMemoFromDB = async (id: string): Promise<void> => {
+  // 1. Delete from Cache API
+  if (hasCacheApi) {
+    try {
+      const cache = await caches.open(CACHE_NAME);
+      await cache.delete(`/memo/${id}`);
+    } catch (e) {
+      console.warn("Failed to delete from cache", e);
+    }
+  }
+
+  // 2. Delete from IndexedDB
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onsuccess = () => {
