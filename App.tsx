@@ -177,6 +177,23 @@ export default function App() {
   };
 
   // --- Logic: Recording ---
+  
+  // Helper to detect supported MIME type for iOS/Safari vs Others
+  const getSupportedMimeType = () => {
+    const types = [
+      'audio/mp4',      // iOS Safari prefer this often
+      'audio/webm;codecs=opus', 
+      'audio/webm',     // Chrome/Firefox
+      'audio/ogg'
+    ];
+    for (const type of types) {
+      if (MediaRecorder.isTypeSupported(type)) {
+        return type;
+      }
+    }
+    return ''; // Let browser decide
+  };
+
   const startRecording = async () => {
     setIsRecording(true);
     audioRef.current.pause();
@@ -184,7 +201,11 @@ export default function App() {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
+      
+      const mimeType = getSupportedMimeType();
+      const options = mimeType ? { mimeType } : undefined;
+      
+      const mediaRecorder = new MediaRecorder(stream, options);
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
 
@@ -195,7 +216,11 @@ export default function App() {
       };
 
       mediaRecorder.onstop = async () => {
-        const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        // Use the mime type determined at start, or fallback to webm if none was explicit (though audioChunks usually have type)
+        // Note: iOS might produce audio/mp4 even if requested webm if strictly not supported, but usually isTypeSupported handles it.
+        const finalType = mimeType || (audioChunksRef.current[0]?.type) || 'audio/webm';
+        
+        const blob = new Blob(audioChunksRef.current, { type: finalType });
         const url = URL.createObjectURL(blob);
         const newMemo: Memo = {
           id: Date.now().toString(),
@@ -216,7 +241,12 @@ export default function App() {
             audioRef.current.src = newMemo.url;
         } catch (err) {
             console.error("Failed to save recording", err);
-            alert("Failed to save recording.");
+            // Don't alert aggressively, maybe the user is in private mode where IDB is restricted
+            alert("Could not save recording to storage. It will be lost on refresh. " + (err instanceof Error ? err.message : String(err)));
+            // Still add to local list so they can hear it now
+            setMemos(prev => [newMemo, ...prev]);
+            setActiveMemoId(newMemo.id);
+            audioRef.current.src = newMemo.url;
         }
         
         setRecordingTime(0);
